@@ -55,7 +55,7 @@ class RoomTableViewController: UITableViewController {
         let scanButton = UIBarButtonItem(title: "Scan New Room", style: .plain, target: self, action: #selector(scanNewRoom))
         navigationItem.rightBarButtonItem = scanButton
         
-        let mergeButton = UIBarButtonItem(title: "Merge & Export", style: .plain, target: self, action: #selector(mergeAndExport))
+        let mergeButton = UIBarButtonItem(title: "Merge Rooms", style: .plain, target: self, action: #selector(mergeAndExport))
         mergeButton.isEnabled = false
         navigationItem.leftBarButtonItem = mergeButton
     }
@@ -350,16 +350,123 @@ class RoomTableViewController: UITableViewController {
             do {
                 finalResults = try await structureBuilder.capturedStructure(from: capturedRoomArray)
                 
-                // Dismiss loading alert
-                loadingAlert.dismiss(animated: true) {
-                    self.exportMergedStructure()
+                // Dismiss loading alert and show options
+                await MainActor.run {
+                    loadingAlert.dismiss(animated: true) {
+                        self.showMergeOptions()
+                    }
                 }
                 
             } catch {
-                loadingAlert.dismiss(animated: true) {
-                    self.showAlert(title: "Merging Error", message: error.localizedDescription)
+                await MainActor.run {
+                    loadingAlert.dismiss(animated: true) {
+                        self.showAlert(title: "Merging Error", message: error.localizedDescription)
+                    }
                 }
             }
+        }
+    }
+    
+    private func showMergeOptions() {
+        let alert = UIAlertController(title: "Merge Complete", 
+                                    message: "Your rooms have been successfully merged. What would you like to do?", 
+                                    preferredStyle: .actionSheet)
+        
+        let previewAction = UIAlertAction(title: "Preview Merged Structure", style: .default) { _ in
+            self.previewMergedStructure()
+        }
+        
+        let exportAction = UIAlertAction(title: "Export Files", style: .default) { _ in
+            self.exportMergedStructure()
+        }
+        
+        let cancelAction = UIAlertAction(title: "Cancel", style: .cancel)
+        
+        alert.addAction(previewAction)
+        alert.addAction(exportAction)
+        alert.addAction(cancelAction)
+        
+        // Configure for iPad
+        if let popover = alert.popoverPresentationController {
+            popover.barButtonItem = navigationItem.leftBarButtonItem
+        }
+        
+        present(alert, animated: true)
+    }
+    
+    private func previewMergedStructure() {
+        guard let finalResults = finalResults else {
+            showAlert(title: "Error", message: "No merged structure available to preview.")
+            return
+        }
+        
+        // Show loading indicator
+        let loadingAlert = UIAlertController(title: "Preparing Preview", 
+                                           message: "Loading merged structure...", 
+                                           preferredStyle: .alert)
+        present(loadingAlert, animated: true)
+        
+        Task {
+            do {
+                let previewURL = try await prepareMergedStructureForViewing(finalResults)
+                
+                await MainActor.run {
+                    loadingAlert.dismiss(animated: true) {
+                        self.presentMergedStructureViewer(for: previewURL)
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    loadingAlert.dismiss(animated: true) {
+                        self.showAlert(title: "Preview Error", 
+                                     message: "Could not prepare merged structure for viewing: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+    
+    private func prepareMergedStructureForViewing(_ capturedStructure: CapturedStructure) async throws -> URL {
+        let tempDir = FileManager.default.temporaryDirectory
+        let previewFolder = tempDir.appendingPathComponent("MergedStructurePreview")
+        try FileManager.default.createDirectory(at: previewFolder, withIntermediateDirectories: true)
+        
+        let usdzURL = previewFolder.appendingPathComponent("MergedStructure_Preview.usdz")
+        
+        // Remove existing file if present
+        if FileManager.default.fileExists(atPath: usdzURL.path) {
+            try FileManager.default.removeItem(at: usdzURL)
+        }
+        
+        // Create metadata URL (required for export)
+        let metadataURL = previewFolder.appendingPathComponent("MergedStructure_Preview.plist")
+        
+        // Export the merged structure
+        try await capturedStructure.export(
+            to: usdzURL,
+            metadataURL: metadataURL,
+            exportOptions: [.mesh]
+        )
+        
+        // Apply centering and scaling for optimal viewing
+        return try await centerAndScaleUSDZ(at: usdzURL, roomName: "Merged Structure")
+    }
+    
+    private func presentMergedStructureViewer(for usdzURL: URL) {
+        let sceneViewController = CustomSceneViewController(usdzURL: usdzURL, roomName: "Merged Structure")
+        
+        // Add export button to the preview
+        let exportButton = UIBarButtonItem(title: "Export", style: .plain, target: self, action: #selector(exportFromPreview))
+        sceneViewController.navigationItem.leftBarButtonItem = exportButton
+        
+        let navController = UINavigationController(rootViewController: sceneViewController)
+        present(navController, animated: true)
+    }
+    
+    @objc private func exportFromPreview() {
+        // Dismiss the preview first, then export
+        presentedViewController?.dismiss(animated: true) {
+            self.exportMergedStructure()
         }
     }
     
