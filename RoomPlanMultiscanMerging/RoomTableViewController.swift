@@ -22,7 +22,7 @@ class RoomTableViewController: UITableViewController {
     private var scannedRooms: [ScannedRoom] = []
     
     /// An object that builds a single structure by merging multiple rooms
-    private let structureBuilder = StructureBuilder(options: [.beautifyObjects])
+    private let structureBuilder = StructureBuilder(options: [])
     
     /// An object that holds a merged result
     private var finalResults: CapturedStructure?
@@ -55,7 +55,7 @@ class RoomTableViewController: UITableViewController {
         let scanButton = UIBarButtonItem(title: "Scan New Room", style: .plain, target: self, action: #selector(scanNewRoom))
         navigationItem.rightBarButtonItem = scanButton
         
-        let mergeButton = UIBarButtonItem(title: "Merge & Export", style: .plain, target: self, action: #selector(mergeAndExport))
+        let mergeButton = UIBarButtonItem(title: "Merge Rooms", style: .plain, target: self, action: #selector(mergeAndExport))
         mergeButton.isEnabled = false
         navigationItem.leftBarButtonItem = mergeButton
     }
@@ -146,18 +146,18 @@ class RoomTableViewController: UITableViewController {
             try FileManager.default.removeItem(at: usdzURL)
         }
         
-        // Try exporting with different options for better viewing
+        // Export with mesh for simple, minimalistic styling
         do {
-            // First try with parametric export which often has better centering
-            try await room.capturedRoom.export(
-                to: usdzURL,
-                exportOptions: [.parametric]
-            )
-        } catch {
-            // Fallback to mesh export if parametric fails
+            // Use mesh export for consistent simple styling
             try await room.capturedRoom.export(
                 to: usdzURL,
                 exportOptions: [.mesh]
+            )
+        } catch {
+            // Fallback to parametric export if mesh fails
+            try await room.capturedRoom.export(
+                to: usdzURL,
+                exportOptions: [.parametric]
             )
         }
         
@@ -357,17 +357,118 @@ class RoomTableViewController: UITableViewController {
             do {
                 finalResults = try await structureBuilder.capturedStructure(from: capturedRoomArray)
                 
-                // Dismiss loading alert
-                loadingAlert.dismiss(animated: true) {
-                    self.exportMergedStructure()
+                // Dismiss loading alert and show preview/export options
+                DispatchQueue.main.async {
+                    loadingAlert.dismiss(animated: true) {
+                        self.showMergedStructureOptions()
+                    }
                 }
                 
             } catch {
-                loadingAlert.dismiss(animated: true) {
-                    self.showAlert(title: "Merging Error", message: error.localizedDescription)
+                DispatchQueue.main.async {
+                    loadingAlert.dismiss(animated: true) {
+                        self.showAlert(title: "Merging Error", message: error.localizedDescription)
+                    }
                 }
             }
         }
+    }
+
+    private func showMergedStructureOptions() {
+        let alert = UIAlertController(title: "Rooms Merged Successfully!", 
+                                    message: "What would you like to do with your merged structure?", 
+                                    preferredStyle: .alert)
+        
+        let previewAction = UIAlertAction(title: "Preview", style: .default) { _ in
+            self.previewMergedStructure()
+        }
+        
+        let exportAction = UIAlertAction(title: "Export", style: .default) { _ in
+            self.exportMergedStructure()
+        }
+        
+        let cancelAction = UIAlertAction(title: "Cancel", style: .cancel)
+        
+        alert.addAction(previewAction)
+        alert.addAction(exportAction)
+        alert.addAction(cancelAction)
+        
+        present(alert, animated: true)
+    }
+
+    private func previewMergedStructure() {
+        guard let mergedStructure = finalResults else {
+            showAlert(title: "Error", message: "No merged structure available to preview.")
+            return
+        }
+        
+        // Show loading indicator
+        let loadingAlert = UIAlertController(title: "Preparing Preview", 
+                                           message: "Loading merged structure...", 
+                                           preferredStyle: .alert)
+        present(loadingAlert, animated: true)
+        
+        Task {
+            do {
+                let usdzURL = try await prepareMergedStructureForViewing(mergedStructure)
+                
+                DispatchQueue.main.async {
+                    loadingAlert.dismiss(animated: true) {
+                        self.presentMergedStructureViewer(for: usdzURL)
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    loadingAlert.dismiss(animated: true) {
+                        self.showAlert(title: "Preview Error", 
+                                     message: "Could not prepare merged structure for viewing: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
+    private func prepareMergedStructureForViewing(_ structure: CapturedStructure) async throws -> URL {
+        let tempDir = FileManager.default.temporaryDirectory
+        let previewFolder = tempDir.appendingPathComponent("MergedStructurePreview")
+        try FileManager.default.createDirectory(at: previewFolder, withIntermediateDirectories: true)
+        
+        let usdzURL = previewFolder.appendingPathComponent("MergedRooms_Preview.usdz")
+        
+        if FileManager.default.fileExists(atPath: usdzURL.path) {
+            try FileManager.default.removeItem(at: usdzURL)
+        }
+        
+        // Export the merged structure for preview with simple styling
+        do {
+            // Use mesh export for consistent simple, minimalistic styling
+            try await structure.export(
+                to: usdzURL,
+                exportOptions: [.mesh]
+            )
+        } catch {
+            // Fallback to parametric export if mesh fails
+            try await structure.export(
+                to: usdzURL,
+                exportOptions: [.parametric]
+            )
+        }
+        
+        // Apply centering and scaling for optimal viewing
+        return try await centerAndScaleUSDZ(at: usdzURL, roomName: "MergedStructure")
+    }
+
+    private func presentMergedStructureViewer(for usdzURL: URL) {
+        let previewController = QLPreviewController()
+        previewController.dataSource = self
+        previewController.delegate = self
+        previewController.currentPreviewItemIndex = 0
+        
+        // Store the URL for the data source
+        self.currentPreviewURL = usdzURL
+        self.currentPreviewTitle = "Merged Rooms"
+        
+        present(previewController, animated: true)
     }
     
     private func exportMergedStructure() {
