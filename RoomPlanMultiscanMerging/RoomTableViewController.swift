@@ -22,7 +22,7 @@ class RoomTableViewController: UITableViewController {
     private var scannedRooms: [ScannedRoom] = []
     
     /// An object that builds a single structure by merging multiple rooms
-    private let structureBuilder = StructureBuilder(options: [])
+    private let structureBuilder = StructureBuilder(options: [.beautifyObjects])
     
     /// An object that holds a merged result
     private var finalResults: CapturedStructure?
@@ -55,7 +55,7 @@ class RoomTableViewController: UITableViewController {
         let scanButton = UIBarButtonItem(title: "Scan New Room", style: .plain, target: self, action: #selector(scanNewRoom))
         navigationItem.rightBarButtonItem = scanButton
         
-        let mergeButton = UIBarButtonItem(title: "Merge Rooms", style: .plain, target: self, action: #selector(mergeAndExport))
+        let mergeButton = UIBarButtonItem(title: "Merge & Export", style: .plain, target: self, action: #selector(mergeAndExport))
         mergeButton.isEnabled = false
         navigationItem.leftBarButtonItem = mergeButton
     }
@@ -146,18 +146,18 @@ class RoomTableViewController: UITableViewController {
             try FileManager.default.removeItem(at: usdzURL)
         }
         
-        // Export with mesh for simple, minimalistic styling
+        // Try exporting with different options for better viewing
         do {
-            // Use mesh export for consistent simple styling
-            try await room.capturedRoom.export(
-                to: usdzURL,
-                exportOptions: [.mesh]
-            )
-        } catch {
-            // Fallback to parametric export if mesh fails
+            // First try with parametric export which often has better centering
             try await room.capturedRoom.export(
                 to: usdzURL,
                 exportOptions: [.parametric]
+            )
+        } catch {
+            // Fallback to mesh export if parametric fails
+            try await room.capturedRoom.export(
+                to: usdzURL,
+                exportOptions: [.mesh]
             )
         }
         
@@ -279,16 +279,9 @@ class RoomTableViewController: UITableViewController {
     }
     
     private func presentRoomViewer(for usdzURL: URL, roomName: String) {
-        let previewController = QLPreviewController()
-        previewController.dataSource = self
-        previewController.delegate = self  // Add delegate
-        previewController.currentPreviewItemIndex = 0
-        
-        // Store the URL for the data source
-        self.currentPreviewURL = usdzURL
-        self.currentPreviewTitle = roomName
-        
-        present(previewController, animated: true)
+        let sceneViewController = CustomSceneViewController(usdzURL: usdzURL, roomName: roomName)
+        let navController = UINavigationController(rootViewController: sceneViewController)
+        present(navController, animated: true)
     }
     
     // MARK: - Scanning functionality
@@ -357,118 +350,17 @@ class RoomTableViewController: UITableViewController {
             do {
                 finalResults = try await structureBuilder.capturedStructure(from: capturedRoomArray)
                 
-                // Dismiss loading alert and show preview/export options
-                DispatchQueue.main.async {
-                    loadingAlert.dismiss(animated: true) {
-                        self.showMergedStructureOptions()
-                    }
+                // Dismiss loading alert
+                loadingAlert.dismiss(animated: true) {
+                    self.exportMergedStructure()
                 }
                 
             } catch {
-                DispatchQueue.main.async {
-                    loadingAlert.dismiss(animated: true) {
-                        self.showAlert(title: "Merging Error", message: error.localizedDescription)
-                    }
+                loadingAlert.dismiss(animated: true) {
+                    self.showAlert(title: "Merging Error", message: error.localizedDescription)
                 }
             }
         }
-    }
-
-    private func showMergedStructureOptions() {
-        let alert = UIAlertController(title: "Rooms Merged Successfully!", 
-                                    message: "What would you like to do with your merged structure?", 
-                                    preferredStyle: .alert)
-        
-        let previewAction = UIAlertAction(title: "Preview", style: .default) { _ in
-            self.previewMergedStructure()
-        }
-        
-        let exportAction = UIAlertAction(title: "Export", style: .default) { _ in
-            self.exportMergedStructure()
-        }
-        
-        let cancelAction = UIAlertAction(title: "Cancel", style: .cancel)
-        
-        alert.addAction(previewAction)
-        alert.addAction(exportAction)
-        alert.addAction(cancelAction)
-        
-        present(alert, animated: true)
-    }
-
-    private func previewMergedStructure() {
-        guard let mergedStructure = finalResults else {
-            showAlert(title: "Error", message: "No merged structure available to preview.")
-            return
-        }
-        
-        // Show loading indicator
-        let loadingAlert = UIAlertController(title: "Preparing Preview", 
-                                           message: "Loading merged structure...", 
-                                           preferredStyle: .alert)
-        present(loadingAlert, animated: true)
-        
-        Task {
-            do {
-                let usdzURL = try await prepareMergedStructureForViewing(mergedStructure)
-                
-                DispatchQueue.main.async {
-                    loadingAlert.dismiss(animated: true) {
-                        self.presentMergedStructureViewer(for: usdzURL)
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    loadingAlert.dismiss(animated: true) {
-                        self.showAlert(title: "Preview Error", 
-                                     message: "Could not prepare merged structure for viewing: \(error.localizedDescription)")
-                    }
-                }
-            }
-        }
-    }
-
-    private func prepareMergedStructureForViewing(_ structure: CapturedStructure) async throws -> URL {
-        let tempDir = FileManager.default.temporaryDirectory
-        let previewFolder = tempDir.appendingPathComponent("MergedStructurePreview")
-        try FileManager.default.createDirectory(at: previewFolder, withIntermediateDirectories: true)
-        
-        let usdzURL = previewFolder.appendingPathComponent("MergedRooms_Preview.usdz")
-        
-        if FileManager.default.fileExists(atPath: usdzURL.path) {
-            try FileManager.default.removeItem(at: usdzURL)
-        }
-        
-        // Export the merged structure for preview with simple styling
-        do {
-            // Use mesh export for consistent simple, minimalistic styling
-            try await structure.export(
-                to: usdzURL,
-                exportOptions: [.mesh]
-            )
-        } catch {
-            // Fallback to parametric export if mesh fails
-            try await structure.export(
-                to: usdzURL,
-                exportOptions: [.parametric]
-            )
-        }
-        
-        // Apply centering and scaling for optimal viewing
-        return try await centerAndScaleUSDZ(at: usdzURL, roomName: "MergedStructure")
-    }
-
-    private func presentMergedStructureViewer(for usdzURL: URL) {
-        let previewController = QLPreviewController()
-        previewController.dataSource = self
-        previewController.delegate = self
-        previewController.currentPreviewItemIndex = 0
-        
-        // Store the URL for the data source
-        self.currentPreviewURL = usdzURL
-        self.currentPreviewTitle = "Merged Rooms"
-        
-        present(previewController, animated: true)
     }
     
     private func exportMergedStructure() {
@@ -756,5 +648,81 @@ extension RoomTableViewController {
     private func SCNVector3FromMatrix4(_ translation: SCNMatrix4, _ transform: SCNMatrix4) -> SCNVector3 {
         let combined = SCNMatrix4Mult(translation, transform)
         return SCNVector3(combined.m41, combined.m42, combined.m43)
+    }
+}
+
+// Add this new custom scene viewer class
+class CustomSceneViewController: UIViewController {
+    private let usdzURL: URL
+    private let roomName: String
+    private var sceneView: SCNView!
+    
+    init(usdzURL: URL, roomName: String) {
+        self.usdzURL = usdzURL
+        self.roomName = roomName
+        super.init(nibName: nil, bundle: nil)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        
+        title = roomName
+        view.backgroundColor = .systemBackground
+        
+        let doneButton = UIBarButtonItem(title: "Done", style: .done, target: self, action: #selector(dismissViewer))
+        navigationItem.rightBarButtonItem = doneButton
+        
+        setupSceneView()
+    }
+    
+    private func setupSceneView() {
+        sceneView = SCNView()
+        sceneView.translatesAutoresizingMaskIntoConstraints = false
+        sceneView.backgroundColor = .systemBackground
+        sceneView.allowsCameraControl = true // Allow user to rotate/zoom
+        sceneView.antialiasingMode = .multisampling4X
+        
+        view.addSubview(sceneView)
+        
+        NSLayoutConstraint.activate([
+            sceneView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            sceneView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            sceneView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            sceneView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+        
+        loadScene()
+    }
+    
+    private func loadScene() {
+        do {
+            let scene = try SCNScene(url: usdzURL, options: nil)
+            sceneView.scene = scene
+            
+            // Set up lighting
+            sceneView.autoenablesDefaultLighting = true
+            
+            // Set up camera
+            let cameraNode = SCNNode()
+            cameraNode.camera = SCNCamera()
+            cameraNode.position = SCNVector3(0, 5, 10) // Position camera above and back
+            cameraNode.look(at: SCNVector3(0, 0, 0))
+            scene.rootNode.addChildNode(cameraNode)
+            
+        } catch {
+            let alert = UIAlertController(title: "Error", message: "Could not load 3D model: \(error.localizedDescription)", preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                self.dismissViewer()
+            })
+            present(alert, animated: true)
+        }
+    }
+    
+    @objc private func dismissViewer() {
+        dismiss(animated: true)
     }
 }
