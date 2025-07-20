@@ -57,11 +57,19 @@ class RoomTableViewController: UITableViewController {
         
         let mergeButton = UIBarButtonItem(title: "Merge Rooms", style: .plain, target: self, action: #selector(mergeAndExport))
         mergeButton.isEnabled = false
-        navigationItem.leftBarButtonItem = mergeButton
+        
+        let clearButton = UIBarButtonItem(title: "Clear All", style: .plain, target: self, action: #selector(clearAllRooms))
+        clearButton.isEnabled = false
+        
+        navigationItem.leftBarButtonItems = [mergeButton, clearButton]
     }
     
     private func updateMergeButton() {
-        navigationItem.leftBarButtonItem?.isEnabled = scannedRooms.count >= 2
+        let hasRooms = !scannedRooms.isEmpty
+        let hasMergeableRooms = scannedRooms.count >= 2
+        
+        navigationItem.leftBarButtonItems?[0].isEnabled = hasMergeableRooms // Merge button
+        navigationItem.leftBarButtonItems?[1].isEnabled = hasRooms // Clear button
     }
 
     // MARK: - Table view data source
@@ -99,6 +107,63 @@ class RoomTableViewController: UITableViewController {
         
         let selectedRoom = scannedRooms[indexPath.row]
         displayRoom(selectedRoom)
+    }
+    
+    override func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle, forRowAt indexPath: IndexPath) {
+        if editingStyle == .delete {
+            let roomToDelete = scannedRooms[indexPath.row]
+            let alert = UIAlertController(title: "Delete Room", message: "Are you sure you want to delete '\(roomToDelete.name)'?", preferredStyle: .alert)
+            
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+            alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { _ in
+                self.deleteRoom(at: indexPath)
+            })
+            
+            present(alert, animated: true)
+        }
+    }
+    
+    override func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool {
+        // Only allow editing if we have actual rooms (not the instruction cell)
+        return !scannedRooms.isEmpty
+    }
+    
+    private func deleteRoom(at indexPath: IndexPath) {
+        let roomToDelete = scannedRooms[indexPath.row]
+        
+        // Clean up any temporary files for this room
+        let tempDir = FileManager.default.temporaryDirectory
+        let fileManager = FileManager.default
+        
+        do {
+            let tempContents = try fileManager.contentsOfDirectory(at: tempDir, 
+                                                                 includingPropertiesForKeys: nil, 
+                                                                 options: [.skipsHiddenFiles])
+            
+            // Clean up room-specific temporary files
+            for item in tempContents {
+                let itemName = item.lastPathComponent
+                if itemName.contains(roomToDelete.name) || itemName.contains("RoomViewing") || itemName.contains("Optimized_") {
+                    try? fileManager.removeItem(at: item)
+                }
+            }
+            
+        } catch {
+            print("Note: Could not clean up temporary files for room: \(error)")
+        }
+        
+        // Remove from memory and update UI
+        scannedRooms.remove(at: indexPath.row)
+        
+        if scannedRooms.isEmpty {
+            // If no rooms left, reload entire table to show instruction cell
+            tableView.reloadData()
+        } else {
+            // Otherwise just delete the specific row
+            tableView.deleteRows(at: [indexPath], with: .fade)
+        }
+        
+        updateMergeButton()
     }
     
     // MARK: - Room Display Methods
@@ -388,7 +453,7 @@ class RoomTableViewController: UITableViewController {
         
         // Configure for iPad
         if let popover = alert.popoverPresentationController {
-            popover.barButtonItem = navigationItem.leftBarButtonItem
+            popover.barButtonItem = navigationItem.leftBarButtonItems?[0] // Merge button
         }
         
         present(alert, animated: true)
@@ -479,7 +544,7 @@ class RoomTableViewController: UITableViewController {
             
             let activityVC = UIActivityViewController(activityItems: [exportFolderURL], applicationActivities: nil)
             activityVC.modalPresentationStyle = .popover
-            activityVC.popoverPresentationController?.barButtonItem = navigationItem.leftBarButtonItem
+            activityVC.popoverPresentationController?.barButtonItem = navigationItem.leftBarButtonItems?[0] // Merge button
             
             present(activityVC, animated: true)
             
@@ -553,6 +618,48 @@ class RoomTableViewController: UITableViewController {
         } catch {
             print("Failed to load prescanned rooms: \(error)")
         }
+    }
+
+    @objc private func clearAllRooms() {
+        let alert = UIAlertController(title: "Clear All Rooms", message: "Are you sure you want to delete all scanned rooms? This action cannot be undone.", preferredStyle: .alert)
+        
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { _ in
+            self.clearScannedRooms()
+        })
+        
+        present(alert, animated: true)
+    }
+    
+    private func clearScannedRooms() {
+        // Clear all rooms from memory
+        scannedRooms.removeAll()
+        
+        // Clean up any temporary files created during scanning/viewing
+        let tempDir = FileManager.default.temporaryDirectory
+        let fileManager = FileManager.default
+        
+        do {
+            let tempContents = try fileManager.contentsOfDirectory(at: tempDir, 
+                                                                 includingPropertiesForKeys: nil, 
+                                                                 options: [.skipsHiddenFiles])
+            
+            // Clean up room-related temporary files
+            for item in tempContents {
+                let itemName = item.lastPathComponent
+                if itemName.contains("RoomViewing") || itemName.contains("MergedStructure") || itemName.contains("Optimized_") {
+                    try? fileManager.removeItem(at: item)
+                }
+            }
+            
+        } catch {
+            print("Note: Could not clean up temporary files: \(error)")
+        }
+        
+        // Update UI
+        tableView.reloadData()
+        updateMergeButton()
+        showAlert(title: "All Rooms Cleared", message: "All rooms have been cleared from the list. Pre-loaded sample rooms will be reloaded when you restart the app.")
     }
 }
 
