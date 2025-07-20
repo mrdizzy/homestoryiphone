@@ -7,6 +7,8 @@ A simplified view controller for scanning and merging rooms.
 
 import UIKit
 import RoomPlan
+import QuickLook
+import SceneKit // Added for centering logic
 
 // Simple structure to store scanned room data
 struct ScannedRoom {
@@ -27,12 +29,17 @@ class RoomTableViewController: UITableViewController {
     
     /// Room capture session for continuous scanning
     private var roomCaptureSession: RoomCaptureSession?
-
+    
+    // Add these properties for QuickLook preview
+    private var currentPreviewURL: URL?
+    private var currentPreviewTitle: String?
+    
     override func viewDidLoad() {
         super.viewDidLoad()
         
         title = "Room Scanner"
         setupNavigationBar()
+        loadPrescannedRooms()
         
         // Initialize room capture session for continuous scanning
         roomCaptureSession = RoomCaptureSession()
@@ -82,6 +89,208 @@ class RoomTableViewController: UITableViewController {
         return cell
     }
 
+    // MARK: - Table view delegate
+    
+    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        
+        // Don't handle tap if showing instruction cell
+        guard !scannedRooms.isEmpty else { return }
+        
+        let selectedRoom = scannedRooms[indexPath.row]
+        displayRoom(selectedRoom)
+    }
+    
+    // MARK: - Room Display Methods
+    
+    private func displayRoom(_ room: ScannedRoom) {
+        // Show loading indicator
+        let loadingAlert = UIAlertController(title: "Preparing Room View", 
+                                           message: "Loading 3D model...", 
+                                           preferredStyle: .alert)
+        present(loadingAlert, animated: true)
+        
+        Task {
+            do {
+                let usdzURL = try await prepareRoomForViewing(room)
+                
+                await MainActor.run {
+                    loadingAlert.dismiss(animated: true) {
+                        self.presentRoomViewer(for: usdzURL, roomName: room.name)
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    loadingAlert.dismiss(animated: true) {
+                        self.showAlert(title: "Display Error", 
+                                     message: "Could not prepare room for viewing: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+    
+    private func prepareRoomForViewing(_ room: ScannedRoom) async throws -> URL {
+        // Check for existing USDZ file first
+        if let bundleURL = Bundle.main.url(forResource: "floorplan", withExtension: "usdz", subdirectory: "MyHome/\(room.name)") {
+            return try await centerAndScaleUSDZ(at: bundleURL, roomName: room.name)
+        }
+        
+        let tempDir = FileManager.default.temporaryDirectory
+        let roomFolder = tempDir.appendingPathComponent("RoomViewing")
+        try FileManager.default.createDirectory(at: roomFolder, withIntermediateDirectories: true)
+        
+        let usdzURL = roomFolder.appendingPathComponent("\(room.name).usdz")
+        
+        if FileManager.default.fileExists(atPath: usdzURL.path) {
+            try FileManager.default.removeItem(at: usdzURL)
+        }
+        
+        // Try exporting with different options for better viewing
+        do {
+            // First try with parametric export which often has better centering
+            try await room.capturedRoom.export(
+                to: usdzURL,
+                exportOptions: [.parametric]
+            )
+        } catch {
+            // Fallback to mesh export if parametric fails
+            try await room.capturedRoom.export(
+                to: usdzURL,
+                exportOptions: [.mesh]
+            )
+        }
+        
+        // Apply centering and scaling for optimal viewing
+        return try await centerAndScaleUSDZ(at: usdzURL, roomName: room.name)
+    }
+    
+    /// Centers and scales a USDZ model for optimal viewing in QuickLook
+    /// Following Apple's best practices for USDZ files
+    private func centerAndScaleUSDZ(at sourceURL: URL, roomName: String) async throws -> URL {
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    // Load the scene from the USDZ file
+                    let scene = try SCNScene(url: sourceURL, options: nil)
+                    
+                    // Calculate the bounding box of all geometry in the scene
+                    var minBounds = SCNVector3(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
+                    var maxBounds = SCNVector3(-Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude)
+                    
+                    self.calculateBounds(for: scene.rootNode, minBounds: &minBounds, maxBounds: &maxBounds, transform: SCNMatrix4Identity)
+                    
+                    // Calculate dimensions and center
+                    let size = SCNVector3(
+                        maxBounds.x - minBounds.x,
+                        maxBounds.y - minBounds.y,
+                        maxBounds.z - minBounds.z
+                    )
+                    
+                    // For room models: center horizontally (X,Z) but keep floor at Y=0
+                    let centerX = (minBounds.x + maxBounds.x) * 0.5
+                    let centerZ = (minBounds.z + maxBounds.z) * 0.5
+                    // For Y, we want the bottom of the model to be at Y=0 (ground plane)
+                    let floorOffset = -minBounds.y
+                    
+                    // Find the largest horizontal dimension for scaling (rooms are typically viewed from the side)
+                    let maxHorizontalDimension = max(size.x, size.z)
+                    
+                    // Create optimal scaling - larger for rooms to make them easily viewable
+                    // Rooms should typically be viewable at a reasonable scale
+                    let targetSize: Float = 6.0 // Increased from 10.0 for better room viewing
+                    let scale = maxHorizontalDimension > 0 ? targetSize / maxHorizontalDimension : 1.0
+                    
+                    // Apply transforms in the correct order for QuickLook
+                    for child in scene.rootNode.childNodes {
+                        // Step 1: Move floor to Y=0 and center horizontally
+                        let positionTransform = SCNMatrix4MakeTranslation(-centerX, floorOffset, -centerZ)
+                        child.transform = SCNMatrix4Mult(child.transform, positionTransform)
+                        
+                        // Step 2: Apply scaling around the origin
+                        let scaleTransform = SCNMatrix4MakeScale(scale, scale, scale)
+                        child.transform = SCNMatrix4Mult(child.transform, scaleTransform)
+                        
+                        // Step 3: Orient for QuickLook (most interesting view toward positive Z)
+                        // For room models, a slight rotation often provides a better initial view
+                        let rotationTransform = SCNMatrix4MakeRotation(Float.pi * 0.1, 1, 0, 0) // Slight downward angle
+                        child.transform = SCNMatrix4Mult(child.transform, rotationTransform)
+                    }
+                    
+                    // Export the centered scene to a new USDZ file
+                    let tempDir = FileManager.default.temporaryDirectory
+                    let centeredURL = tempDir.appendingPathComponent("Optimized_\(roomName)_\(UUID().uuidString).usdz")
+                    
+                    scene.write(to: centeredURL, options: nil, delegate: nil) { (totalProgress, error, stop) in
+                        if let error = error {
+                            continuation.resume(throwing: error)
+                            return
+                        }
+                        
+                        if totalProgress >= 1.0 {
+                            continuation.resume(returning: centeredURL)
+                        }
+                    }
+                    
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+    
+    /// Recursively calculates the bounding box of all geometry in a scene node hierarchy
+    private func calculateBounds(for node: SCNNode, minBounds: inout SCNVector3, maxBounds: inout SCNVector3, transform: SCNMatrix4) {
+        let nodeTransform = SCNMatrix4Mult(transform, node.transform)
+        
+        // Check if this node has geometry
+        if let geometry = node.geometry {
+            let (localMin, localMax) = geometry.boundingBox
+            
+            // Transform the 8 corners of the bounding box
+            let corners = [
+                SCNVector3(localMin.x, localMin.y, localMin.z),
+                SCNVector3(localMin.x, localMin.y, localMax.z),
+                SCNVector3(localMin.x, localMax.y, localMin.z),
+                SCNVector3(localMin.x, localMax.y, localMax.z),
+                SCNVector3(localMax.x, localMin.y, localMin.z),
+                SCNVector3(localMax.x, localMin.y, localMax.z),
+                SCNVector3(localMax.x, localMax.y, localMin.z),
+                SCNVector3(localMax.x, localMax.y, localMax.z)
+            ]
+            
+            for corner in corners {
+                let transformedCorner = SCNVector3FromMatrix4(SCNMatrix4MakeTranslation(corner.x, corner.y, corner.z), nodeTransform)
+                
+                minBounds.x = min(minBounds.x, transformedCorner.x)
+                minBounds.y = min(minBounds.y, transformedCorner.y)
+                minBounds.z = min(minBounds.z, transformedCorner.z)
+                
+                maxBounds.x = max(maxBounds.x, transformedCorner.x)
+                maxBounds.y = max(maxBounds.y, transformedCorner.y)
+                maxBounds.z = max(maxBounds.z, transformedCorner.z)
+            }
+        }
+        
+        // Recursively process child nodes
+        for child in node.childNodes {
+            calculateBounds(for: child, minBounds: &minBounds, maxBounds: &maxBounds, transform: nodeTransform)
+        }
+    }
+    
+    private func presentRoomViewer(for usdzURL: URL, roomName: String) {
+        let previewController = QLPreviewController()
+        previewController.dataSource = self
+        previewController.delegate = self  // Add delegate
+        previewController.currentPreviewItemIndex = 0
+        
+        // Store the URL for the data source
+        self.currentPreviewURL = usdzURL
+        self.currentPreviewTitle = roomName
+        
+        present(previewController, animated: true)
+    }
+    
     // MARK: - Scanning functionality
 
     @objc private func scanNewRoom() {
@@ -211,6 +420,40 @@ class RoomTableViewController: UITableViewController {
                                                 withIntermediateDirectories: true)
         return exportFolderURL
     }
+    
+    private func loadPrescannedRooms() {
+        guard let myHomeURL = Bundle.main.url(forResource: "MyHome", withExtension: nil) else { return }
+        
+        let fileManager = FileManager.default
+        do {
+            let roomFolders = try fileManager.contentsOfDirectory(at: myHomeURL, 
+                                                                includingPropertiesForKeys: nil, 
+                                                                options: [.skipsHiddenFiles])
+            
+            for folder in roomFolders where folder.hasDirectoryPath {
+                let roomName = folder.lastPathComponent
+                let capturedRoomURL = folder.appendingPathComponent("capturedRoom.json")
+                
+                if fileManager.fileExists(atPath: capturedRoomURL.path) {
+                    do {
+                        let data = try Data(contentsOf: capturedRoomURL)
+                        let capturedRoom = try JSONDecoder().decode(CapturedRoom.self, from: data)
+                        let scannedRoom = ScannedRoom(name: roomName, capturedRoom: capturedRoom)
+                        scannedRooms.append(scannedRoom)
+                    } catch {
+                        print("Failed to load room \(roomName): \(error)")
+                    }
+                }
+            }
+            
+            DispatchQueue.main.async {
+                self.tableView.reloadData()
+                self.updateMergeButton()
+            }
+        } catch {
+            print("Failed to load prescanned rooms: \(error)")
+        }
+    }
 }
 
 // MARK: - Alert helper
@@ -219,6 +462,46 @@ extension RoomTableViewController {
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
+    }
+}
+
+// MARK: - QuickLook Data Source
+extension RoomTableViewController: QLPreviewControllerDataSource {
+    func numberOfPreviewItems(in controller: QLPreviewController) -> Int {
+        return currentPreviewURL != nil ? 1 : 0
+    }
+    
+    func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+        guard let url = currentPreviewURL else {
+            fatalError("Preview URL should not be nil")
+        }
+        
+        return RoomPreviewItem(url: url, title: currentPreviewTitle ?? "Room Model")
+    }
+}
+
+// MARK: - QuickLook Delegate
+extension RoomTableViewController: QLPreviewControllerDelegate {
+    func previewController(_ controller: QLPreviewController, editingModeFor previewItem: QLPreviewItem) -> QLPreviewItemEditingMode {
+        return .disabled  // Disable editing if not needed
+    }
+    
+    func previewController(_ controller: QLPreviewController, transitionViewFor item: QLPreviewItem) -> UIView? {
+        return nil  // Use default transition
+    }
+}
+
+// Helper class for QuickLook preview
+class RoomPreviewItem: NSObject, QLPreviewItem {
+    let url: URL
+    let title: String
+    
+    var previewItemURL: URL? { return url }
+    var previewItemTitle: String? { return title }
+    
+    init(url: URL, title: String) {
+        self.url = url
+        self.title = title
     }
 }
 
@@ -363,5 +646,14 @@ class RoomScanViewController: UIViewController, RoomCaptureViewDelegate, RoomCap
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
+    }
+}
+
+// MARK: - SceneKit Helper Extensions
+extension RoomTableViewController {
+    /// Helper function to transform a vector by a matrix
+    private func SCNVector3FromMatrix4(_ translation: SCNMatrix4, _ transform: SCNMatrix4) -> SCNVector3 {
+        let combined = SCNMatrix4Mult(translation, transform)
+        return SCNVector3(combined.m41, combined.m42, combined.m43)
     }
 }
